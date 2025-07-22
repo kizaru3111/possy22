@@ -1,5 +1,5 @@
 aiogram==3.2.0
 python-dotenv==1.0.0
-mysql-connector-python==8.3.0
-pdfplumber==0.10.3
+mysql-connector-python==8.0.33
+pdfplumber==0.7.6
 aiohttp==3.9.1
