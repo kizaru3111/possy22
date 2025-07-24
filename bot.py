@@ -1,9 +1,11 @@
 import os
 import sys
 import json
-import mysql.connector
+import aiomysql
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandStart
+from threading import Thread
+from contextlib import asynccontextmanager
 from aiogram.types import (
     Message,
     CallbackQuery,
@@ -75,6 +77,9 @@ MYSQL_CONFIG = {
     'connect_timeout': 5
 }
 
+# Глобальные переменные
+pool = None  # Пул подключений к БД
+
 # Инициализация бота
 bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
@@ -98,63 +103,59 @@ class AdminStates(StatesGroup):
     view_stats = State()
 
 # --- Вспомогательные функции ---
-def get_db():
-    """Возвращает соединение с базой данных"""
+async def init_db():
+    """Инициализирует пул подключений к базе данных"""
+    global pool
     try:
-        conn = mysql.connector.connect(**MYSQL_CONFIG)
-        conn.autocommit = True
-        return conn
+        pool = await aiomysql.create_pool(
+            host=os.getenv('DB_HOST'),
+            user=os.getenv('DB_USER'),
+            password=os.getenv('DB_PASSWORD'),
+            db=os.getenv('DB_NAME'),
+            autocommit=True,
+            pool_recycle=3600,
+            maxsize=10,
+            charset='utf8mb4'
+        )
+        return pool
     except Exception as e:
-        logger.error(f"Ошибка подключения к БД: {e}")
+        logger.error(f"Ошибка создания пула БД: {e}")
         return None
+
+@asynccontextmanager
+async def get_db():
+    """Асинхронный контекстный менеджер для работы с БД"""
+    if pool is None:
+        await init_db()
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            yield cur
 
 async def execute_db(query: str, params=None, fetch_one=False, fetch_all=False, commit=False):
     """Выполняет SQL запрос с обработкой ошибок"""
-    conn = None
-    cursor = None
     try:
-        conn = get_db()
-        if not conn:
-            return None
-
-        cursor = conn.cursor(dictionary=True, buffered=True)  # Используем буферизованный курсор
-        cursor.execute(query, params or ())
-
-        if commit:
-            conn.commit()
-            result = True
-        elif fetch_one:
-            result = cursor.fetchone()
-        elif fetch_all:
-            result = cursor.fetchall()
-        else:
-            result = True
-
-        return result
+        async with get_db() as cur:
+            await cur.execute(query, params or ())
+            if fetch_one:
+                return await cur.fetchone()
+            elif fetch_all:
+                return await cur.fetchall()
+            elif commit:
+                return True
+            return True
     except Exception as e:
         logger.error(f"Ошибка выполнения запроса: {e}")
         return None
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            try:
-                # Убеждаемся, что все результаты получены
-                while conn.unread_result:
-                    cursor = conn.cursor(dictionary=True, buffered=True)
-                    cursor.fetchall()
-                    cursor.close()
-            except Exception:
-                pass
-            finally:
-                conn.close()
 
 async def notify_website(user_id: int, session_id: str):
     """Уведомляет сайт об обновлении сессии"""
     try:
+        # Получаем базовый URL из переменной окружения Replit или используем localhost
+        base_url = os.getenv('REPLIT_APP_URL', 'http://localhost:5000')
+        
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                'http://localhost:5000/api/session_updated',
+                f"{base_url}/api/session_updated",
                 json={'user_id': user_id, 'session_id': session_id},
                 timeout=2
             ):
@@ -661,11 +662,24 @@ async def generate_code(user_id: int, tariff: str) -> tuple[str, str]:
 
     return code, session_id
 
+# --- Основные настройки ---
+
 # --- Запуск бота ---
 async def main():
     """Основная функция запуска"""
     logger.info("Бот запускается...")
-    await dp.start_polling(bot)
+    
+    # Инициализируем пул подключений к БД
+    if await init_db() is None:
+        logger.error("Не удалось инициализировать подключение к БД")
+        return
+        
+    try:
+        await dp.start_polling(bot)
+    finally:
+        if pool:
+            pool.close()
+            await pool.wait_closed()
 
 if __name__ == '__main__':
     asyncio.run(main())
